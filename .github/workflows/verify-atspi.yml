@@ -1,0 +1,74 @@
+# Fork-only verification, never part of a pull request: reads samples/AtSpiVerify over a real AT-SPI bus with
+# AtSpiNode as it is on this branch's parent commit and as the fix leaves it, then runs the automation unit tests.
+name: Verify AT-SPI
+
+on:
+  push:
+    branches: ['verify/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 3
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - name: Install Xvfb and AT-SPI
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends xvfb at-spi2-core dbus-x11 python3-gi gir1.2-atspi-2.0 libglib2.0-bin
+
+      - name: Start Xvfb
+        run: |
+          Xvfb :99 -screen 0 1280x800x24 > "$RUNNER_TEMP/xvfb.log" 2>&1 &
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+
+      # The samples load Avalonia's XAML tasks from the build tasks' own output folder, so they are built first and
+      # nothing is built with --output.
+      - name: Build Avalonia's build tasks
+        run: dotnet build src/Avalonia.Build.Tasks/Avalonia.Build.Tasks.csproj -c Release
+
+      - name: Read the app with the fix
+        run: |
+          dotnet build samples/AtSpiVerify/AtSpiVerify.csproj -c Release
+          app="$(find samples/AtSpiVerify/bin/Release -name AtSpiVerify -type f | head -n 1)"
+          bash samples/AtSpiVerify/run.sh "$(dirname "$app")" "$RUNNER_TEMP/fixed.json"
+          cat "$RUNNER_TEMP/fixed.json"
+
+      - name: Read the app without the fix
+        run: |
+          git show HEAD~2:src/Avalonia.FreeDesktop.AtSpi/AtSpiNode.cs > src/Avalonia.FreeDesktop.AtSpi/AtSpiNode.cs
+          git diff --stat
+          dotnet build samples/AtSpiVerify/AtSpiVerify.csproj -c Release
+          app="$(find samples/AtSpiVerify/bin/Release -name AtSpiVerify -type f | head -n 1)"
+          bash samples/AtSpiVerify/run.sh "$(dirname "$app")" "$RUNNER_TEMP/before.json"
+          cat "$RUNNER_TEMP/before.json"
+          git checkout -- src/Avalonia.FreeDesktop.AtSpi/AtSpiNode.cs
+
+      - name: Compare
+        run: |
+          before="$RUNNER_TEMP/before.json" fixed="$RUNNER_TEMP/fixed.json"
+          {
+            echo "### Without the fix"; echo '```json'; cat "$before"; echo '```'
+            echo "### With the fix"; echo '```json'; cat "$fixed"; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          jq -e '.rows_before == ["one","two"] and .rows_after == ["one","two"]' "$before" > /dev/null \
+            || { echo "::error::without the fix the list did not keep its first rows, so this does not reproduce the bug"; exit 1; }
+          jq -e '.rows_after == ["one","two","three"] and any(.children_changed_events[]; test("children-changed:add"))' "$fixed" > /dev/null \
+            || { echo "::error::with the fix the list's AT-SPI children did not follow its rows"; exit 1; }
+          echo "without the fix the third row never appears; with it the list lists it and sends children-changed:add"
+
+      - name: Automation unit tests with the fix
+        if: ${{ !cancelled() }}
+        run: dotnet test --project tests/Avalonia.Controls.UnitTests/Avalonia.Controls.UnitTests.csproj -c Release --filter-namespace Avalonia.Controls.UnitTests.Automation
