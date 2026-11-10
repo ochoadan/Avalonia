@@ -11,6 +11,7 @@ using Avalonia.DBus;
 using Avalonia.FreeDesktop.AtSpi.DBusXml;
 using Avalonia.FreeDesktop.AtSpi.Handlers;
 using Avalonia.Logging;
+using Avalonia.Threading;
 using static Avalonia.FreeDesktop.AtSpi.AtSpiConstants;
 
 namespace Avalonia.FreeDesktop.AtSpi
@@ -24,7 +25,8 @@ namespace Avalonia.FreeDesktop.AtSpi
         private bool _attached;
         private bool _childrenDirty = true;
         private List<AtSpiNode> _attachedChildren = [];
-        private HashSet<AutomationPeer> _itemHosts = [];
+        private HashSet<AutomationPeer>? _itemHosts;
+        private bool _itemHostsUpdatePosted;
 
         private readonly string _path;
 
@@ -222,45 +224,71 @@ namespace Avalonia.FreeDesktop.AtSpi
 
             var items = new List<AutomationPeer>();
             var hosts = new HashSet<AutomationPeer>();
-            CollectSelectionItemPeers(Peer.GetChildren(), items, hosts);
+            CollectSelectionItemPeers(Peer.GetChildren(), items, hosts, watch: true);
             WatchItemHosts(hosts);
             return items.Count > 0 ? items : Peer.GetChildren();
         }
 
         private static void CollectSelectionItemPeers(
-            IReadOnlyList<AutomationPeer> peers, List<AutomationPeer> result, HashSet<AutomationPeer> hosts)
+            IReadOnlyList<AutomationPeer> peers, List<AutomationPeer> result, HashSet<AutomationPeer> hosts, bool watch)
         {
             foreach (var peer in peers)
             {
                 if (peer.GetProvider<ISelectionItemProvider>() is not null)
                 {
                     result.Add(peer);
+                    continue;
                 }
-                else
-                {
+
+                // A root, such as a ComboBox's popup, is its own AT-SPI window and reports changes to what it holds.
+                var watchChildren = watch && peer.GetProvider<IRootProvider>() is null;
+
+                if (watchChildren)
                     hosts.Add(peer);
-                    CollectSelectionItemPeers(peer.GetChildren(), result, hosts);
-                }
+
+                CollectSelectionItemPeers(peer.GetChildren(), result, hosts, watchChildren);
             }
         }
 
         // The peers between a selection container and its items, such as its items panel, have no node of their
         // own, so a change to their children is a change to this node's.
-        private void WatchItemHosts(HashSet<AutomationPeer> hosts)
+        private void WatchItemHosts(HashSet<AutomationPeer>? hosts)
         {
-            foreach (var host in _itemHosts)
+            if (_itemHosts is not null)
             {
-                if (!hosts.Contains(host))
-                    host.ChildrenChanged -= OnPeerChildrenChanged;
+                foreach (var host in _itemHosts)
+                {
+                    if (hosts is null || !hosts.Contains(host))
+                        host.ChildrenChanged -= OnItemHostChildrenChanged;
+                }
             }
 
-            foreach (var host in hosts)
+            if (hosts is not null)
             {
-                if (!_itemHosts.Contains(host))
-                    host.ChildrenChanged += OnPeerChildrenChanged;
+                foreach (var host in hosts)
+                {
+                    if (_itemHosts is null || !_itemHosts.Contains(host))
+                        host.ChildrenChanged += OnItemHostChildrenChanged;
+                }
             }
 
-            _itemHosts = hosts;
+            _itemHosts = hosts is { Count: > 0 } ? hosts : null;
+        }
+
+        // Item hosts change many times in a row while a list scrolls, so the children are updated once, after the burst.
+        private void OnItemHostChildrenChanged(object? sender, EventArgs e)
+        {
+            if (_itemHostsUpdatePosted)
+                return;
+
+            _itemHostsUpdatePosted = true;
+            Dispatcher.UIThread.Post(
+                () =>
+                {
+                    _itemHostsUpdatePosted = false;
+                    OnPeerChildrenChanged(this, EventArgs.Empty);
+                },
+                DispatcherPriority.Background);
         }
 
         internal IReadOnlyList<AtSpiNode> EnsureChildren()
@@ -415,7 +443,7 @@ namespace Avalonia.FreeDesktop.AtSpi
             Parent = null;
             Peer.ChildrenChanged -= OnPeerChildrenChanged;
             Peer.PropertyChanged -= OnPeerPropertyChanged;
-            WatchItemHosts([]);
+            WatchItemHosts(null);
             DisposePathRegistration();
         }
 
