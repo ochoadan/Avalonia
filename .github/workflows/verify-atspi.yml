@@ -1,0 +1,80 @@
+# Fork-only verification, never part of a pull request: reads samples/AtSpiVerify over a real AT-SPI bus with
+# AtSpiNode as this revision leaves it, as the pull request stood before it, and as Avalonia's main has it, then runs
+# the automation unit tests.
+name: Verify AT-SPI
+
+on:
+  push:
+    branches: ['verify/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 6
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - name: Install Xvfb and AT-SPI
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends xvfb at-spi2-core dbus-x11 python3-gi gir1.2-atspi-2.0 libglib2.0-bin
+
+      - name: Start Xvfb
+        run: |
+          Xvfb :99 -screen 0 1280x800x24 > "$RUNNER_TEMP/xvfb.log" 2>&1 &
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+
+      # The samples load Avalonia's XAML tasks from the build tasks' own output folder, so they are built first and
+      # nothing is built with --output.
+      - name: Build Avalonia's build tasks
+        run: dotnet build src/Avalonia.Build.Tasks/Avalonia.Build.Tasks.csproj -c Release
+
+      # HEAD is this verification, HEAD~1 the revision, HEAD~2 the pull request before it, and HEAD~2^2 Avalonia's main.
+      - name: Read the app three ways
+        run: |
+          node=src/Avalonia.FreeDesktop.AtSpi/AtSpiNode.cs
+          for case in revision:HEAD~1 pull-request:HEAD~2 main:HEAD~2^2; do
+            name="${case%%:*}" commit="${case#*:}"
+            git show "$commit:$node" > "$node"
+            dotnet build samples/AtSpiVerify/AtSpiVerify.csproj -c Release
+            app="$(find samples/AtSpiVerify/bin/Release -name AtSpiVerify -type f | head -n 1)"
+            bash samples/AtSpiVerify/run.sh "$(dirname "$app")" "$RUNNER_TEMP/$name.json"
+            echo "== $name"; cat "$RUNNER_TEMP/$name.json"
+          done
+          git checkout -- "$node"
+
+      - name: Compare
+        run: |
+          {
+            for name in revision pull-request main; do echo "### $name"; echo '```json'; cat "$RUNNER_TEMP/$name.json"; echo '```'; done
+          } >> "$GITHUB_STEP_SUMMARY"
+          jq -e '.rows_before == ["one","two"] and .rows_after == ["one","two"]' "$RUNNER_TEMP/main.json" > /dev/null \
+            || { echo "::error::on main the list did not keep its first rows, so this does not reproduce the bug"; exit 1; }
+          jq -e '.rows_after == ["one","two","three"] and any(.add_events[]; test("children-changed:add"))' "$RUNNER_TEMP/revision.json" > /dev/null \
+            || { echo "::error::with the revision the list's AT-SPI children did not follow its rows"; exit 1; }
+          # Rows put back are new containers, so the burst's net change is reported; the revision must report only that, not each step.
+          list_events() { jq '[.burst_events[] | select(endswith("on '"'"'ListBox'"'"'"))] | length' "$RUNNER_TEMP/$1.json"; }
+          jq -e '.rows_after_burst == ["one","two","three"]' "$RUNNER_TEMP/revision.json" > /dev/null \
+            || { echo "::error::with the revision the list did not end with its three rows"; exit 1; }
+          [ "$(list_events revision)" -lt "$(list_events pull-request)" ] \
+            || { echo "::error::with the revision the burst was reported step by step, as before"; exit 1; }
+          jq -e '.combo_events == []' "$RUNNER_TEMP/revision.json" > /dev/null \
+            || { echo "::error::with the revision the ComboBox reported children that its popup holds"; exit 1; }
+          for name in pull-request revision; do
+            echo "$name: the list reported the burst in $(list_events "$name") events, the ComboBox its popup's item in $(jq '.combo_events | length' "$RUNNER_TEMP/$name.json")"
+          done
+
+      - name: Automation unit tests with the revision
+        if: ${{ !cancelled() }}
+        run: dotnet test --project tests/Avalonia.Controls.UnitTests/Avalonia.Controls.UnitTests.csproj -c Release --filter-namespace Avalonia.Controls.UnitTests.Automation
